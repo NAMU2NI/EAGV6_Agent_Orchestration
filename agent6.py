@@ -173,13 +173,44 @@ async def run(
             force_answer = goal_tool_calls >= MAX_TOOL_CALLS_PER_GOAL
             _kv(trace, "goal_tool_calls", goal_tool_calls)
             _kv(trace, "force_answer", force_answer)
+
+            # Code-level fetch steering: inject the exact URL to fetch so
+            # Decision can't retry a blocked URL or reuse one another goal
+            # already fetched successfully.
+            decision_goal = goal
+            if not force_answer and _is_fetch_goal(goal.text):
+                attempts = _fetch_attempts(history, goal.id)
+                has_failed = attempts and all(_is_failed_result(desc) for _, desc in attempts)
+
+                # Also steer on the first attempt if the natural first search
+                # URL was already successfully fetched by a different goal.
+                search_urls = _search_urls_from_history(history)
+                globally_done = _successfully_fetched_urls(history)
+                first_url_taken = (
+                    not attempts
+                    and bool(search_urls)
+                    and search_urls[0] in globally_done
+                )
+
+                if has_failed or first_url_taken:
+                    next_url = _next_fetch_url(history, goal.id)
+                    if next_url:
+                        decision_goal = goal.model_copy(update={
+                            "text": (
+                                f"{goal.text} — previous URL(s) were blocked, empty, or "
+                                f"already read by another goal. "
+                                f"You MUST call fetch_url with this URL: {next_url}"
+                            )
+                        })
+                        _line(trace, f"[fetch-steer] → {next_url}")
+
             t0 = time.time()
             try:
                 out = await _with_timeout(
                     "decision",
                     asyncio.to_thread(
                         decision.next_step,
-                        goal,
+                        decision_goal,
                         hits,
                         attached,
                         history,
@@ -244,13 +275,16 @@ async def run(
             _kv(trace, "tool", out.tool_call.name)
             _kv(trace, "goal_id", goal.id)
             _kv(trace, "artifact_id", art_id or "none")
+            # web_search results contain multiple URLs; store enough to
+            # capture all 5 so fetch-steer can find untried ones.
+            descriptor_limit = 2000 if out.tool_call.name == "web_search" else 300
             history.append(AgentHistoryItem(
                 iter=it,
                 kind="action",
                 goal_id=goal.id,
                 tool=out.tool_call.name,
                 arguments=out.tool_call.arguments,
-                result_descriptor=result_text[:300],
+                result_descriptor=result_text[:descriptor_limit],
                 artifact_id=art_id,
             ))
             _kv(trace, "history_items", len(history))
@@ -306,6 +340,76 @@ def _tool_call_count(history: list[AgentHistoryItem], goal_id: str | None) -> in
         for item in history
         if item.kind == "action" and item.goal_id == goal_id
     )
+
+
+# ── Fetch-goal URL steering ────────────────────────────────────────────────
+
+def _is_fetch_goal(text: str) -> bool:
+    t = text.lower()
+    return "fetch and read" in t or "fetch the" in t
+
+
+def _is_failed_result(descriptor: str) -> bool:
+    import re
+    if not descriptor:
+        return True
+    low = descriptor.lower()
+    if any(k in low for k in ("error executing tool", "403", "forbidden", "timeout")):
+        return True
+    m = re.search(r'"length_bytes":\s*(\d+)', descriptor)
+    if m and int(m.group(1)) < 500:
+        return True
+    return False
+
+
+def _fetch_attempts(history: list[AgentHistoryItem], goal_id: str) -> list[tuple[str, str]]:
+    """Return (url, result_descriptor) for every fetch_url action on this goal."""
+    out = []
+    for item in history:
+        if item.kind == "action" and item.goal_id == goal_id and item.tool == "fetch_url":
+            url = (item.arguments or {}).get("url", "")
+            out.append((url, item.result_descriptor or ""))
+    return out
+
+
+def _search_urls_from_history(history: list[AgentHistoryItem]) -> list[str]:
+    """Ordered list of URLs from the most recent web_search in history."""
+    import re
+    for item in reversed(history):
+        if item.kind == "action" and item.tool == "web_search":
+            found = re.findall(r'"url":\s*"([^"]+)"', item.result_descriptor or "")
+            if found:
+                return found
+    return []
+
+
+def _successfully_fetched_urls(history: list[AgentHistoryItem]) -> set[str]:
+    """URLs that produced a successful artifact for ANY goal in this run."""
+    out = set()
+    for item in history:
+        if item.kind == "action" and item.tool == "fetch_url" and item.artifact_id:
+            url = (item.arguments or {}).get("url", "")
+            if url:
+                out.add(url)
+    return out
+
+
+def _next_fetch_url(history: list[AgentHistoryItem], goal_id: str) -> str | None:
+    """Return the first search-result URL not yet tried for this goal AND not
+    already successfully fetched by any other goal in this run."""
+    tried_this_goal = {url for url, _ in _fetch_attempts(history, goal_id)}
+    globally_done = _successfully_fetched_urls(history)
+    skip = tried_this_goal | globally_done
+
+    search_urls = _search_urls_from_history(history)
+    for url in search_urls:
+        if url not in skip:
+            return url
+    # All search URLs are globally exhausted — fall back to just skipping this goal's tried set
+    for url in search_urls:
+        if url not in tried_this_goal:
+            return url
+    return None
 
 
 def ensure_gateway() -> None:

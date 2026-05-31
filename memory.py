@@ -54,7 +54,7 @@ def _ensure_state() -> None:
 
 def _load() -> list[MemoryItem]:
     _ensure_state()
-    raw = json.loads(MEMORY_PATH.read_text(encoding="utf-8") or "[]")
+    raw = json.loads(MEMORY_PATH.read_text(encoding="utf-8-sig") or "[]")
     return [MemoryItem.model_validate(item) for item in raw]
 
 

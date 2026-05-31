@@ -43,6 +43,29 @@ Rules:
   from memory_hits. If no, leave artifact_index null.
 - Do not invent artifact indexes. Do not reference artifact handles.
 - Do not add, drop, or reorder goals after the first iteration.
+
+Multi-source fetch rule:
+- When the query asks to read, fetch, or analyse N specific sources (e.g. "read
+  the top 3 results", "check each of the 5 pages", "fetch both articles"), create
+  one goal per source fetch — never a single bulk "read all N" goal.
+- The per-fetch goals must come AFTER the search/identify goal and BEFORE the
+  synthesis goal. Use ordinal labels so Decision knows which source to fetch:
+  "Fetch and read the 1st result URL", "Fetch and read the 2nd result URL", etc.
+- CRITICAL — history vs memory_hits:
+  * `history` = actions taken in THIS run. This is the ONLY source of truth for
+    whether a fetch goal is done.
+  * `memory_hits` = results from PRIOR runs kept for context. They must NEVER be
+    used to mark a fetch goal as done. A fetch_url entry in memory_hits does not
+    count as satisfying a per-fetch goal in the current run.
+- A per-fetch goal is done ONLY when the `history` array (not memory_hits)
+  contains a fetch_url tool_call result for that ordinal position that returned
+  SUBSTANTIAL content — meaning no error (no "403", no "Error executing tool")
+  AND length_bytes > 500. A near-empty or blocked fetch does NOT satisfy the goal.
+- If history shows a fetch_url for this ordinal that errored or returned < 500
+  bytes, the goal stays OPEN so Decision can try a different URL from the search
+  results.
+- An answer listing URLs does NOT satisfy a fetch goal.
+- The synthesis goal is done only after ALL per-fetch goals are done.
 """
 
 

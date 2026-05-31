@@ -521,3 +521,185 @@ router pool:
 3. **Free-tier reality forces design choices.** Cerebras `gpt-oss-120b` 404s on the test account despite the docs. The May-27 deprecation is real and looming. These aren't bugs to fix, they're constraints to design around — and the four-router pool is the design response.
 4. **Token thresholds are honest, not aspirational.** The 1K elbow is set where free-tier small models actually start failing, not where their context windows nominally end. The 8K ceiling is set where free-tier Gemini quality actually starts dropping. Students should learn to test these elbows themselves with their own keys.
 5. **`fallback_used` is the honest measure of routing health.** A dashboard that shows high `fallback_used` count tells you the router pool is overloaded; the gateway didn't lie about its decisions, it just couldn't make them with a real LLM. This is the kind of observability you can only build when the architecture is honest about failure modes.
+
+---
+
+## Example run — Agent6 in action
+
+**Query:** `Fetch https://en.wikipedia.org/wiki/Claude_Shannon and tell me his birth date, death date, and three key contributions to information theory.`
+
+**Date:** 2026-05-30 | **Run ID:** `92edf9b2` | **Wall clock:** 64.4 s | **Iterations:** 4 of 8
+
+### Iteration trace
+
+| Iter | Goal | Action | Outcome |
+|------|------|--------|---------|
+| 1 | Fetch the Wikipedia page | `fetch_url("https://en.wikipedia.org/wiki/Claude_Shannon")` | Artifact `art:89ee0a2a35597446` (10 223 bytes) saved |
+| 2 | Extract birth date | Read artifact | **April 30, 1916** |
+| 3 | Extract death date | Read artifact | **February 24, 2001** |
+| 4 | Identify 3 key contributions | Read artifact | Three contributions synthesised (see answer below) |
+
+Perception correctly marked g1 done after iteration 1, then attached the cached artifact to each of g2–g4 in turn so the decision LLM could read raw bytes without re-fetching the page.
+
+### Final answer
+
+> Claude Shannon was born on **April 30, 1916**, and died on **February 24, 2001**.
+>
+> Three key contributions he made to information theory:
+>
+> 1. **Founded information theory** — his 1948 paper *"A Mathematical Theory of Communication"* provided a general mathematical framework for communication systems and a rigorous way to analyse information transmission over noisy channels. Often called the "Magna Carta of the Information Age."
+>
+> 2. **Introduced the bit** — formally defined the *bit* as the basic unit of information, giving a precise quantitative measure that underlies all modern digital communication, storage, and computing.
+>
+> 3. **Established channel capacity** — proved that every noisy channel has a maximum rate (the *Shannon limit*) at which information can be sent with arbitrarily low error, laying the groundwork for modern coding theory, data compression, and error-correcting codes.
+
+### What this run demonstrates
+
+- **Artifact caching across iterations** — the 10 KB Wikipedia page is fetched once in iteration 1, stored as a binary artifact, and re-attached by Perception to each subsequent goal. No redundant network calls.
+- **Goal decomposition and sequential resolution** — Perception decomposes a single user query into four atomic goals and resolves them one per iteration, marking each done before opening the next.
+- **Graceful Wikipedia access** — direct Wikipedia access was blocked; `fetch_url` fell back to the DuckDuckGo proxy transparently, and the artifact still contained full markdown text.
+- **Routing in practice** — each Perception and Decision LLM call was classified by the router pool and dispatched to the appropriate tier worker, with no manual provider selection needed.
+
+---
+
+## Example run 2 — multi-source reasoning with real weather data
+
+**Query:** `Find 3 family-friendly things to do in Tokyo this weekend. Check Saturday's weather forecast there and tell me which one is most appropriate.`
+
+**Date:** 2026-05-30 | **Run ID:** `a9fa6729` | **Wall clock:** 91.8 s | **Iterations:** 4 of 8
+
+### Iteration trace
+
+| Iter | Goal | Action | Outcome |
+|------|------|--------|---------|
+| 1 | Find 3 family-friendly activities in Tokyo this weekend | `web_search(...)` + `fetch_url("timeout.com/tokyo/...")` | Artifact `art:6612bdec528ee19e` (31 209 bytes) with Time Out Tokyo listings |
+| 2 | Identify the three activities | Read artifact | Hibiya Music Festival, Fussa Firefly Festival, 100% Doraemon & Friends |
+| 3 | Retrieve Saturday's weather forecast | Read cached BBC Weather artifact `art:aadde6a5d22dd253` (from prior run memory) | **6 June — drizzle, 25 °C high / 17 °C low, gentle easterly breeze** |
+| 4 | Recommend the best activity for Saturday | Synthesise activities + weather | **100% Doraemon & Friends** (indoor, weather-proof) |
+
+Memory carried over a BBC Weather artifact (`art:aadde6a5d22dd253`) fetched in a previous run — Perception attached it directly to g2, saving a redundant network call.
+
+### Saturday weather (Tokyo, 6 June 2026)
+
+| Condition | High | Low | Wind |
+|-----------|------|-----|------|
+| Drizzle, gentle breeze | 25 °C (77 °F) | 17 °C (62 °F) | ~9 mph easterly |
+
+### Final answer
+
+**Three family-friendly activities:**
+
+1. **Hibiya Music Festival** *(Hibiya & Tokyo International Forum, central Tokyo)*
+   Free outdoor music festival with live performances, workshops, and food stalls. Casual open-air atmosphere. Some Forum-za stage events need advance free lottery tickets.
+
+2. **Fussa Firefly Festival** *(Fussa, western Tokyo)*
+   Daytime hula, taiko, and brass band shows; firefly release into a riverside park 7:20–8:30 pm (peak ~8 pm). Free numbered ticket required from Fussa City Social Welfare Centre on the day.
+
+3. **"100% Doraemon & Friends" Exhibition** *(Ariake, Tokyo)*
+   Indoor exhibition with 100+ figures, manga panels, animation, and themed food. Open 10:00–18:00 (last entry 17:30). Tickets from ¥2,400 adults; discounts for children.
+
+**Weather-based recommendation:** The **"100% Doraemon & Friends" Exhibition** — fully indoor, so drizzle and damp ground have no impact, and it's comfortable with kids all day. The other two are outdoor events best suited to dry weather.
+
+### What this run demonstrates
+
+- **Cross-run memory reuse** — the BBC Weather artifact was fetched in a prior session and retrieved from persistent memory, allowing Perception to attach it to the weather goal without re-fetching.
+- **Multi-source synthesis** — activities came from a Time Out Tokyo web page (one source); weather came from a BBC Weather page (second source); the recommendation fused both to give a grounded, weather-aware answer.
+- **Graceful tool failure recovery** — `get_time` failed in the previous run (missing `tzdata` on Windows). The fix was installed and the agent correctly used the BBC Weather artifact to determine the Saturday date (6 June) rather than relying on the clock.
+- **Goal ordering** — Perception correctly sequenced three dependent goals: gather activities → get weather → recommend, only opening the next goal after the prior one was marked done.
+
+---
+
+## Example run 3 — persistent memory: storing and recalling a personal fact
+
+Two back-to-back runs showing the memory system at work across separate agent sessions.
+
+### Run 3a — store a fact and generate reminders
+
+**Query:** `My mom's birthday is 15 May 2026. Remember that and give me a calendar reminder for two weeks before and on the day.`
+
+**Date:** 2026-05-30 | **Run ID:** `c0ea1bd8` | **Wall clock:** 34.9 s | **Iterations:** 2 of 8
+
+#### Iteration trace
+
+| Iter | Goal | Action | Outcome |
+|------|------|--------|---------|
+| 1 | Store the fact that mom's birthday is 15 May 2026 | Memory write at boot; Decision answers immediately | Fact persisted to `memory.json` |
+| 2 | Generate calendar reminder entries | Decision synthesises reminders (no tool call needed) | Two reminders produced |
+
+#### Final answer
+
+**Reminder 1 — Two weeks before**
+- Date: **1 May 2026**
+- Title: "Prepare for Mom's Birthday"
+- Notes: buy/arrange gift and card, plan celebration, confirm reservations
+
+**Reminder 2 — On the day**
+- Date: **15 May 2026**
+- Title: "Mom's Birthday Today"
+- Notes: call/visit Mom, send birthday message and gift, any special plans
+
+---
+
+### Run 3b — recall the stored fact in a fresh session
+
+**Query:** `When is mom's birthday?`
+
+**Date:** 2026-05-30 | **Run ID:** `e200f2bd` | **Wall clock:** 22.7 s | **Iterations:** 1 of 8
+
+#### Iteration trace
+
+| Iter | Goal | Action | Outcome |
+|------|------|--------|---------|
+| 1 | Determine the date of the user's mom's birthday | Memory read at boot returns the stored fact; Decision answers immediately | **15 May 2026** |
+
+#### Final answer
+
+> Your mom's birthday is on **15 May 2026**.
+
+### What this pair of runs demonstrates
+
+- **Durable cross-session memory** — the birthday fact written in run 3a was stored to `state/memory.json` and retrieved in run 3b without any tool calls. The second session had no prior context yet answered correctly in a single iteration.
+- **Memory-first short-circuit** — when the answer is already in memory, Perception sets a single goal, Decision reads the hit and answers immediately, and the loop exits in 1 iteration (22.7 s wall clock vs. 64+ s for tool-heavy runs).
+- **Fact vs. tool-outcome memory** — the birthday entry is stored as `kind=fact`, not `kind=tool_outcome`. The memory system distinguishes durable user preferences from ephemeral tool results, so facts survive across unrelated runs while stale search results age out.
+- **Boot-time memory write** — the agent writes the fact at boot (before iteration 1), so it is persisted even if the run is interrupted or fails before completing all goals.
+
+---
+
+## Example run 4 — multi-source fetch with URL fallback steering
+
+**Query:** `Search for 'Python asyncio best practices', read the top 3 results, and give me a short numbered list of the advice they agree on.`
+
+**Date:** 2026-05-31 | **Run ID:** `02056a11` | **Wall clock:** 152.5 s | **Iterations:** 8 of 8
+
+### Iteration trace
+
+| Iter | Goal | Action | Outcome |
+|------|------|--------|---------|
+| 1 | Search the web | `web_search("Python asyncio best practices")` | 5 URLs returned |
+| 2 | Fetch 1st result URL | `fetch_url(discuss.python.org)` | 128 bytes — JS-blocked, no artifact |
+| 3 | Fetch 1st result URL | `[fetch-steer]` → `fetch_url(realpython.com)` | `art:f7e830f3e0e8bfe4` (56 KB) ✓ |
+| 4 | Fetch 1st result URL | Decision answers (goal_tool_calls=2) | g2 closed, g3 marked done via memory |
+| 5–6 | Fetch 1st result URL | Retried discuss.python.org (steer bug) | 128 bytes again, force_answer fires |
+| 7 | Fetch 3rd result URL | `fetch_url(medium.com)` | 403 Forbidden |
+| 8 | Fetch 3rd result URL | `[fetch-steer]` → `fetch_url(discuss.python.org)` | 128 bytes — steer picked already-failed URL |
+
+### Final answer
+
+1. **Use `async`/`await` correctly** — only call async functions with `await` or `asyncio.create_task`; never block the event loop with CPU-bound or synchronous I/O work.
+
+2. **Keep the event loop unblocked** — offload CPU-bound work to threads or processes (`loop.run_in_executor`, `concurrent.futures`); use async-native libraries (`aiohttp` instead of `requests`).
+
+3. **Structure tasks carefully** — use `asyncio.create_task` for background work and `asyncio.gather` to run coroutines concurrently; keep references to tasks and cancel them explicitly on shutdown.
+
+4. **Handle errors and cancellation** — wrap concurrent calls in `try`/`except`, handle `asyncio.CancelledError` properly, and use `return_exceptions=True` in `asyncio.gather` to inspect failures explicitly.
+
+5. **Use `asyncio.run()` as the main entry point** — prefer `asyncio.run(main())` over manually creating and closing event loops; avoid mixing multiple event loops in the same thread.
+
+6. **Protect shared state** — guard shared mutable data accessed from multiple tasks with `asyncio.Lock`; prefer passing data explicitly over global state.
+
+### What this run demonstrates (and what it exposed)
+
+- **Fetch-steer working** — when `discuss.python.org` returned only 128 bytes (JS-blocked), the code-level steer in `agent6.py` detected the failure and redirected Decision to `realpython.com`, which produced a 56 KB artifact.
+- **Steer picks already-failed URL** — in iter 8, the steer selected `discuss.python.org` for g4 even though it had already failed for g2. Root cause: `_next_fetch_url` excludes globally *successful* URLs but not globally *failed* ones from other goals. Fix: also exclude URLs that produced failed fetches for any goal.
+- **g3 marked done without a fresh fetch** — Perception credited the `realpython.com` artifact (fetched under g2) toward g3 via memory hits, skipping a fresh g3 fetch entirely. This saved one iteration but means g3 and g2 read the same source.
+- **Memory pollution from prior runs** — despite clearing `memory.json`, the index still referenced two artifacts from a partial run between the clear and this run. Old tool outcomes in memory can mislead Perception into marking goals done prematurely.

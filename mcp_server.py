@@ -168,19 +168,135 @@ async def _crawl4ai_fetch(url: str, timeout: int = 20) -> dict:
     }
 
 
-def _httpx_fetch(url: str, timeout: int = 20) -> dict:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+def _wikipedia_api_url(url: str) -> str | None:
+    """Convert a Wikipedia article URL to the Action API (plain-text extract).
+    en.wikipedia.org/wiki/X → en.wikipedia.org/w/api.php?action=query&...
+    The Action API is designed for bots and does not block programmatic access."""
+    import re
+    m = re.match(r"https?://([\w.]+)/wiki/(.+)", url)
+    if m and "wikipedia.org" in m.group(1):
+        title = m.group(2)
+        return (
+            f"https://{m.group(1)}/w/api.php"
+            f"?action=query&titles={title}&prop=extracts"
+            f"&explaintext=1&format=json&redirects=1"
         )
+    return None
+
+
+def _ddg_instant_answer(title: str) -> dict | None:
+    """Retrieve a Wikipedia article via DuckDuckGo when direct Wikipedia access is blocked.
+
+    Combines the DDG Instant Answer API (abstract + infobox) with up to 5 DDG
+    text-search results for the same topic. The combined document is typically
+    > 4 KB, which causes action.py to store it as a named artifact — preserving
+    the same agent behaviour as a successful full-page fetch would have.
+    """
+    import re
+    import urllib.parse
+    clean_title = re.sub(r"#.*$", "", title).replace("_", " ").strip()
+    query = urllib.parse.quote_plus(clean_title)
+    ia_url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    try:
+        with httpx.Client(timeout=10, follow_redirects=True, headers=headers) as client:
+            r = client.get(ia_url)
+            r.raise_for_status()
+        data = r.json()
+        abstract = data.get("AbstractText", "")
+        if not abstract:
+            return None
+        source = data.get("AbstractSource") or "Wikipedia"
+        parts = [f"# {clean_title}", f"*Source: {source} (via DuckDuckGo — direct Wikipedia access blocked)*", "", abstract]
+
+        # Infobox structured data — skip raw Wikidata objects (non-string values)
+        infobox = data.get("Infobox") or {}
+        items = infobox.get("content") or []
+        fact_lines = []
+        for item in items:
+            label = item.get("label", "")
+            value = item.get("value", "")
+            if label and isinstance(value, str) and value.strip():
+                fact_lines.append(f"- **{label}**: {value}")
+        if fact_lines:
+            parts += ["", "## Key Facts"] + fact_lines
+
+        # Related topics from DDG (skip if empty)
+        related = [t for t in (data.get("RelatedTopics") or []) if t.get("Text")]
+        if related:
+            parts += ["", "## Related Topics"]
+            for topic in related[:8]:
+                text_val = topic.get("Text", "") or ""
+                first_url = topic.get("FirstURL", "") or ""
+                parts.append(f"- {text_val}" + (f" ({first_url})" if first_url else ""))
+
+        # Full web-search results to ensure the document crosses the artifact
+        # threshold (4096 bytes). A real page fetch would return tens of KB;
+        # these snippets provide equivalent navigable content for the agent.
+        search_results = _ddg_search(clean_title, 5)
+        _bump("duckduckgo")
+        if search_results:
+            parts += ["", "## Web Search Results"]
+            for idx, res in enumerate(search_results, 1):
+                parts += [
+                    f"### {idx}. {res['title']}",
+                    f"URL: {res['url']}",
+                    res["snippet"],
+                    "",
+                ]
+
+        text = "\n".join(parts)
+        return {
+            "status": 200,
+            "content_type": "text/markdown",
+            "length_bytes": len(text.encode("utf-8")),
+            "text": text,
+        }
+    except Exception:
+        return None
+
+
+def _httpx_fetch(url: str, timeout: int = 20) -> dict:
+    import re
+    is_wiki = bool(re.match(r"https?://[\w.]*wikipedia\.org/", url))
+    fetch_target = _wikipedia_api_url(url) or url
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/html, */*",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:
-        r = client.get(url)
-        r.raise_for_status()
+        r = client.get(fetch_target)
+
+    # Wikimedia IPs-blocks certain networks with a hard 403. When that happens
+    # fall back to DuckDuckGo Instant Answer, which returns the same Wikipedia
+    # abstract + infobox without requiring direct *.wikipedia.org connectivity.
+    if r.status_code == 403 and is_wiki:
+        m = re.match(r"https?://[\w.]+/wiki/(.+)", url)
+        if m:
+            result = _ddg_instant_answer(m.group(1))
+            if result:
+                return result
+
+    r.raise_for_status()
     content_type = r.headers.get("content-type", "application/octet-stream").split(";")[0]
     text = r.text
-    if "html" in content_type:
+    if "json" in content_type:
+        import json as _json
+        try:
+            data = _json.loads(text)
+            pages = (data.get("query") or {}).get("pages") or {}
+            page = next(iter(pages.values()), {})
+            title = page.get("title", url)
+            extract = page.get("extract", text)
+            text = f"# {title}\n\n{extract}"
+        except Exception:
+            pass
+        content_type = "text/markdown"
+    elif "html" in content_type:
         soup = BeautifulSoup(text, "lxml")
         for tag in soup(["script", "style", "noscript", "svg"]):
             tag.decompose()
