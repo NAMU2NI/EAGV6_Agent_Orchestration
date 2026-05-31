@@ -1,3 +1,8 @@
+
+Here is the youtube video of Agent 6 Orchestration 
+
+https://youtu.be/sdHYoV3ceWo 
+
 # LLM Gateway V3
 
 A local FastAPI service that routes LLM calls across **7 free worker providers** (Ollama, Gemini, NVIDIA NIM, Groq, Cerebras, OpenRouter, GitHub Models) with automatic failover, capability-aware routing, prompt caching, native tool-use, structured output — **and a separate pool of 4 router LLMs that classify incoming requests and pick which worker tier should handle them**.
